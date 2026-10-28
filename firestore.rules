@@ -1,0 +1,537 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Users ──────────────────────────────────────────────────────────────
+    match /users/{userId} {
+      // get: individual profile reads for authenticated users (owner lookups).
+      // list: DENIED — with it, any account could dump the entire user base
+      // (names + phones). The app never lists users; it only gets by uid.
+      allow get: if request.auth != null;
+      allow list: if false;
+
+      // A newly registered user creates their own profile right after sign-up
+      // At that point request.auth.uid already matches userId
+      allow create: if request.auth != null && request.auth.uid == userId;
+
+      // Only the owner can update their own profile
+      allow update: if request.auth != null && request.auth.uid == userId;
+
+      allow delete: if false;
+    }
+
+    // ── Businesses (locales) ───────────────────────────────────────────────
+    match /locales/{localId} {
+      // Public read so clients can search without being logged in
+      allow read: if true;
+
+      // Only authenticated users with tipo=="dueno" can create
+      allow create: if request.auth != null
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.tipo == 'dueno';
+
+      // Only the owner of this specific business can edit/delete...
+      allow update: if request.auth != null
+        && (resource.data.ownerId == request.auth.uid
+            // ...EXCEPT rating fields (recalculated after leaving a review).
+            // Bounded to sane values so they can't be set to garbage.
+            // NOTE: a malicious user could still recalc-spoof within range —
+            // full fix is moving the recalc server-side (see audit).
+            || (request.resource.data.diff(resource.data).affectedKeys()
+                  .hasOnly(['calificacion', 'totalResenas'])
+                && request.resource.data.calificacion is number
+                && request.resource.data.calificacion >= 0
+                && request.resource.data.calificacion <= 5
+                && request.resource.data.totalResenas is int
+                && request.resource.data.totalResenas >= 0
+                && request.resource.data.totalResenas <= resource.data.get('totalResenas', 0) + 1));
+      allow delete: if request.auth != null
+        && resource.data.ownerId == request.auth.uid;
+    }
+
+    // ── Services (servicios) ───────────────────────────────────────────────
+    match /servicios/{servicioId} {
+      allow read: if true;
+
+      allow create: if request.auth != null
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.tipo == 'dueno';
+
+      allow update, delete: if request.auth != null
+        && get(/databases/$(database)/documents/locales/$(resource.data.localId)).data.ownerId == request.auth.uid;
+    }
+
+    // ── Appointments (citas) ───────────────────────────────────────────────
+    match /citas/{citaId} {
+      // get  → only the client or the business owner can read the full document
+      allow get: if request.auth != null
+        && (resource.data.clienteId == request.auth.uid
+            || resource.data.ownerId == request.auth.uid);
+
+      // list → ONLY your own citas (as client or owner). Availability checks
+      //        now go through /api/disponibilidad (Admin SDK), which returns
+      //        only occupied hours — no stranger metadata ever reaches a
+      //        client. Firestore proves queries safe when they filter by
+      //        clienteId == uid or ownerId == uid.
+      allow list: if request.auth != null
+        && (resource.data.clienteId == request.auth.uid
+            || resource.data.ownerId == request.auth.uid);
+
+      // Create: either booking for YOURSELF, or the business owner creating
+      // a manual/assisted cita. Blocks booking in someone else's name.
+      allow create: if request.auth != null
+        && (request.resource.data.clienteId == request.auth.uid
+            || request.resource.data.ownerId == request.auth.uid);
+
+      // Owner: full management (approve/reject/start/finish/cancel/reschedule).
+      // Client: only three flows — cancel, request a reschedule, or respond to
+      // the business's reschedule proposal. Never financial/state spoofing.
+      allow update: if request.auth != null
+        && (resource.data.ownerId == request.auth.uid
+            || (resource.data.clienteId == request.auth.uid
+                && (
+                  // 1) Cancel own cita (+ review flag)
+                  (request.resource.data.diff(resource.data).affectedKeys()
+                     .hasOnly(['estado', 'canceladaPor', 'canceladaPorNombre',
+                               'fechaCancelacion', 'motivoCancelacion',
+                               'updatedAt', 'historial', 'resenaDejada'])
+                   && (request.resource.data.estado == resource.data.estado
+                       || request.resource.data.estado == 'cancelada_cliente'))
+                  ||
+                  // 2) Request a reschedule (from pendiente/aprobada)
+                  (resource.data.estado in ['pendiente', 'aprobada']
+                   && request.resource.data.estado == 'reprogramacion_solicitada'
+                   && request.resource.data.diff(resource.data).affectedKeys()
+                        .hasOnly(['estado', 'fechaPropuesta', 'horaPropuesta',
+                                  'propuestaPor', 'motivoReprogramacion',
+                                  'updatedAt', 'historial']))
+                  ||
+                  // 3) Respond to the business's proposal (accept moves fecha/hora)
+                  (resource.data.estado == 'reprogramacion_propuesta'
+                   && request.resource.data.estado == 'aprobada'
+                   && request.resource.data.diff(resource.data).affectedKeys()
+                        .hasOnly(['estado', 'fecha', 'hora', 'fechaPropuesta',
+                                  'horaPropuesta', 'propuestaPor',
+                                  'motivoReprogramacion', 'updatedAt', 'historial']))
+                )));
+
+      allow delete: if false;
+    }
+
+    // ── Notifications ──────────────────────────────────────────────────────
+    match /notificaciones/{notifId} {
+      allow read: if request.auth != null
+        && resource.data.usuarioId == request.auth.uid;
+
+      // create: DENIED client-side. All notifications flow through
+      // /api/notify (Admin SDK), which verifies the sender and audits writes.
+      // Before this, anyone could inject notifications into anyone's inbox.
+      allow create: if false;
+
+      allow update: if request.auth != null
+        && resource.data.usuarioId == request.auth.uid;
+
+      allow delete: if false;
+    }
+
+    // ── Blocked slots (bloqueados) ─────────────────────────────────────────
+    match /bloqueados/{bloqueadoId} {
+      allow read: if true;
+
+      allow create: if request.auth != null
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.tipo == 'dueno';
+
+      allow update, delete: if request.auth != null
+        && get(/databases/$(database)/documents/locales/$(resource.data.localId)).data.ownerId == request.auth.uid;
+    }
+
+    // ── Assisted clients directory (Reserva Asistida) ──────────────────────
+    // Private per owner: only they can see their clients' data.
+    // Conversion/linking runs server-side via Admin SDK (bypasses rules).
+    match /clientes_asistidos/{asistidoId} {
+      allow read: if request.auth != null
+        && resource.data.ownerId == request.auth.uid;
+      allow create: if request.auth != null
+        && request.resource.data.ownerId == request.auth.uid;
+      allow update: if request.auth != null
+        && resource.data.ownerId == request.auth.uid;
+      allow delete: if false;
+    }
+
+    // ── Recurring series (series) ──────────────────────────────────────────
+    // Metadata only; the real bookings are citas with serieId (own rules).
+    match /series/{serieId} {
+      allow read: if request.auth != null
+        && (resource.data.clienteId == request.auth.uid
+            || resource.data.ownerId == request.auth.uid);
+      allow create: if request.auth != null
+        && request.resource.data.clienteId == request.auth.uid;
+      allow update: if request.auth != null
+        && (resource.data.clienteId == request.auth.uid
+            || resource.data.ownerId == request.auth.uid);
+      allow delete: if false;
+    }
+
+    // ── Event packages (paquetes) ──────────────────────────────────────────
+    match /paquetes/{paqueteId} {
+      allow read: if true;
+      allow create: if request.auth != null
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.tipo == 'dueno';
+      allow update, delete: if request.auth != null
+        && get(/databases/$(database)/documents/locales/$(resource.data.localId)).data.ownerId == request.auth.uid;
+    }
+
+    // ── Events (eventos — catering/banquetes) ──────────────────────────────
+    match /eventos/{eventoId} {
+      allow get: if request.auth != null
+        && (resource.data.clienteId == request.auth.uid
+            || resource.data.ownerId == request.auth.uid);
+      // list needed for capacity checks (filtered by localId, like citas)
+      allow list: if request.auth != null;
+      allow create: if request.auth != null
+        && (request.resource.data.clienteId == request.auth.uid
+            || request.resource.data.ownerId == request.auth.uid);
+      // Owner: full management. Client: only accept quote or cancel —
+      // otherwise they could edit precioFinal or anticipoMonto themselves.
+      allow update: if request.auth != null
+        && (resource.data.ownerId == request.auth.uid
+            || (resource.data.clienteId == request.auth.uid
+                && request.resource.data.diff(resource.data).affectedKeys()
+                     .hasOnly(['estado', 'updatedAt', 'historial'])
+                && request.resource.data.estado in ['anticipo_pendiente', 'cancelado']));
+      allow delete: if false;
+    }
+
+    // ── Favorites ──────────────────────────────────────────────────────────
+    // Doc ID = userId_localId (deterministic, prevents duplicates).
+    match /favoritos/{favId} {
+      // read: owner lists their own; count-by-business allowed for any auth user
+      allow read: if request.auth != null;
+      allow create: if request.auth != null
+        && request.resource.data.userId == request.auth.uid;
+      allow delete: if request.auth != null
+        && resource.data.userId == request.auth.uid;
+      allow update: if false;
+    }
+
+    // ── Slot locks (anti double-booking) ───────────────────────────────────
+    // Deterministic id localId_fecha_hora. Created inside the booking
+    // transaction; deleted when a cita dies (cancel/reject/expire).
+    match /slots/{slotId} {
+      allow read: if request.auth != null;
+      // create only — a lock can never be overwritten, that's the whole point
+      allow create: if request.auth != null;
+      allow update: if false;
+      allow delete: if request.auth != null;
+    }
+
+    // ── Email verification codes ───────────────────────────────────────────
+    // Server-only (Admin SDK): codes are hashed and must never be readable.
+    match /email_codes/{uid} {
+      allow read, write: if false;
+    }
+
+    // ── Password recovery codes + security audit ───────────────────────────
+    // Strictly server-only: OTP hashes and reset tickets must never leak.
+    match /recovery_codes/{uid} {
+      allow read, write: if false;
+    }
+    match /security_audit/{docId} {
+      allow read, write: if false;
+    }
+
+    // ── Push subscriptions ─────────────────────────────────────────────────
+    // Written/deleted by the server (Admin SDK bypasses rules).
+    // Client-side: deny all so subscriptions are never exposed to other users.
+    match /push_subscriptions/{docId} {
+      allow read, write: if false;
+    }
+
+        // interfaz los ocultara.
+ // ── Finanzas por cita (PRIVADO del dueño) ──────────────────────────────
+    // doc id = citaId. Los montos viven aquí y NO en la cita, porque el
+    // cliente puede leer su propia cita: ahí los vería por red aunque la
+    // interfaz los ocultara.
+    match /finanzas/{citaId} {
+      allow read, write: if request.auth != null
+        && (request.resource == null
+            ? resource.data.ownerId == request.auth.uid
+            : request.resource.data.ownerId == request.auth.uid);
+    }
+
+    // ── Reviews (reseñas) ──────────────────────────────────────────────────
+    match /resenas/{resenaId} {
+      allow read: if true;
+      // Anti fake-reviews: the review must reference a FINALIZED cita that
+      // belongs to the reviewer, with a bounded 1-5 rating.
+      allow create: if request.auth != null
+        && request.resource.data.clienteId == request.auth.uid
+        && request.resource.data.calificacion is number
+        && request.resource.data.calificacion >= 1
+        && request.resource.data.calificacion <= 5
+        && request.resource.data.citaId is string
+        && get(/databases/$(database)/documents/citas/$(request.resource.data.citaId)).data.clienteId == request.auth.uid
+        && get(/databases/$(database)/documents/citas/$(request.resource.data.citaId)).data.estado == 'finalizada';
+      allow update: if request.auth != null
+        && resource.data.clienteId == request.auth.uid;
+      allow delete: if false;
+    }
+
+    // >>> ASISTENCIA ESCOLAR >>>
+    // ══════════════════════════════════════════════════════════════════════
+    // ── ASISTENCIA ESCOLAR (colecciones con prefijo asis_) ────────────────
+    // Bloque autocontenido: va DENTRO de `match /databases/{database}/documents`.
+    // Acceso solo para usuarios con documento activo en asis_users (los
+    // usuarios de citasFacil no ven nada aunque compartan Authentication).
+    // ══════════════════════════════════════════════════════════════════════
+
+    function asisSignedIn() {
+      return request.auth != null;
+    }
+    function asisUserPath(uid) {
+      return /databases/$(database)/documents/asis_users/$(uid);
+    }
+    function asisIsStaff() {
+      return asisSignedIn()
+        && exists(asisUserPath(request.auth.uid))
+        && get(asisUserPath(request.auth.uid)).data.active == true;
+    }
+    function asisIsAdmin() {
+      return asisIsStaff() && get(asisUserPath(request.auth.uid)).data.role == 'admin';
+    }
+    function asisStr(v, min, max) {
+      return v is string && v.size() >= min && v.size() <= max;
+    }
+    function asisOptStr(v, max) {
+      return v == null || asisStr(v, 1, max);
+    }
+    function asisYmd(v) {
+      return v is string && v.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
+    }
+    function asisStatus(v) {
+      return v in ['present', 'late', 'absent', 'justified'];
+    }
+    function asisChanged() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+    function asisVerifiedEmail() {
+      return asisSignedIn()
+        && request.auth.token.email is string
+        && request.auth.token.email_verified == true;
+    }
+    function asisSession(id) {
+      return get(/databases/$(database)/documents/asis_sessions/$(id)).data;
+    }
+
+    // ── Usuarios autorizados ─────────────────────────────────────────────
+    function asisValidUser(d) {
+      return d.keys().hasOnly(['email', 'displayName', 'role', 'active', 'createdAt', 'createdBy', 'lastSeen'])
+        && asisStr(d.email, 3, 254)
+        && asisStr(d.displayName, 1, 80)
+        && d.role in ['admin', 'teacher']
+        && d.active is bool;
+    }
+    function asisInvitePath() {
+      return /databases/$(database)/documents/asis_invites/$(request.auth.token.email.lower());
+    }
+
+    match /asis_users/{uid} {
+      allow get: if asisSignedIn() && (request.auth.uid == uid || asisIsAdmin());
+      allow list: if asisIsAdmin();
+
+      // a) Un admin da de alta a alguien (por UID).
+      // b) Un invitado con correo VERIFICADO reclama su invitación: el rol
+      //    debe ser exactamente el de la invitación (no puede autoasignarse admin).
+      allow create: if asisValidUser(request.resource.data)
+        && request.resource.data.createdAt == request.time
+        && (
+          asisIsAdmin()
+          || (request.auth.uid == uid
+              && asisVerifiedEmail()
+              && exists(asisInvitePath())
+              && request.resource.data.email == request.auth.token.email.lower()
+              && request.resource.data.role == get(asisInvitePath()).data.role
+              && request.resource.data.active == true)
+        );
+
+      // El admin gestiona a OTROS usuarios (no puede degradarse ni bloquearse a sí mismo).
+      // Cada usuario solo puede tocar su nombre visible y lastSeen: nunca su rol ni su estado.
+      allow update: if asisValidUser(request.resource.data)
+        && (
+          (asisIsAdmin() && uid != request.auth.uid
+            && request.resource.data.email == resource.data.email)
+          || (asisSignedIn() && uid == request.auth.uid
+              && asisChanged().hasOnly(['displayName', 'lastSeen'])
+              && (!('lastSeen' in asisChanged()) || request.resource.data.lastSeen == request.time))
+        );
+
+      allow delete: if asisIsAdmin() && uid != request.auth.uid;
+    }
+
+    // ── Invitaciones (id = correo en minúsculas) ─────────────────────────
+    match /asis_invites/{email} {
+      allow get: if asisIsAdmin()
+        || (asisSignedIn() && request.auth.token.email is string && email == request.auth.token.email.lower());
+      allow list: if asisIsAdmin();
+      allow create, update: if asisIsAdmin()
+        && request.resource.data.keys().hasOnly(['email', 'displayName', 'role', 'createdAt', 'createdBy'])
+        && request.resource.data.email == email
+        && asisStr(email, 3, 254)
+        && asisStr(request.resource.data.displayName, 1, 80)
+        && request.resource.data.role in ['admin', 'teacher']
+        && request.resource.data.createdBy == request.auth.uid;
+      allow delete: if asisIsAdmin()
+        || (asisVerifiedEmail() && email == request.auth.token.email.lower());
+    }
+
+    // ── Configuración institucional ──────────────────────────────────────
+    match /asis_settings/{docId} {
+      allow read: if asisIsStaff();
+      allow write: if asisIsAdmin()
+        && docId == 'institution'
+        && request.resource.data.keys().hasOnly(['name', 'timezone', 'updatedAt', 'updatedBy'])
+        && asisStr(request.resource.data.name, 1, 100)
+        && asisStr(request.resource.data.timezone, 1, 64)
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.updatedBy == request.auth.uid;
+    }
+
+    // ── Grupos ───────────────────────────────────────────────────────────
+    function asisValidGroup(d) {
+      return d.keys().hasOnly(['name', 'description', 'active', 'createdAt', 'createdBy'])
+        && asisStr(d.name, 1, 60)
+        && d.description is string && d.description.size() <= 200
+        && d.active is bool;
+    }
+    match /asis_groups/{groupId} {
+      allow read: if asisIsStaff();
+      allow create: if asisIsAdmin()
+        && asisValidGroup(request.resource.data)
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.createdBy == request.auth.uid;
+      allow update: if asisIsAdmin()
+        && asisValidGroup(request.resource.data)
+        && asisChanged().hasOnly(['name', 'description', 'active']);
+      allow delete: if asisIsAdmin();
+    }
+
+    // ── Alumnos ──────────────────────────────────────────────────────────
+    function asisValidStudent(d) {
+      return d.keys().hasOnly(['fullName', 'nameLower', 'enrollmentId', 'groupId', 'active', 'qrToken',
+                               'createdAt', 'updatedAt', 'createdBy'])
+        && asisStr(d.fullName, 1, 120)
+        && asisStr(d.nameLower, 1, 120)
+        && asisOptStr(d.enrollmentId, 40)
+        && asisStr(d.groupId, 1, 128)
+        && d.active is bool
+        && asisStr(d.qrToken, 22, 64)
+        && d.updatedAt == request.time;
+    }
+    match /asis_students/{studentId} {
+      allow read: if asisIsStaff();
+      allow create: if asisIsAdmin()
+        && asisValidStudent(request.resource.data)
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.createdBy == request.auth.uid;
+      allow update: if asisIsAdmin()
+        && asisValidStudent(request.resource.data)
+        && asisChanged().hasOnly(['fullName', 'nameLower', 'enrollmentId', 'groupId', 'active', 'qrToken', 'updatedAt']);
+      // Borrar la ficha NO borra sus registros de asistencia (asis_records es inmutable).
+      allow delete: if asisIsAdmin();
+    }
+
+    // ── Sesiones de asistencia ───────────────────────────────────────────
+    match /asis_sessions/{sessionId} {
+      allow read: if asisIsStaff();
+
+      allow create: if asisIsStaff()
+        && request.resource.data.keys().hasOnly(['groupId', 'groupName', 'date', 'label', 'status',
+                                                 'startedAt', 'startedBy', 'startedByName', 'totals'])
+        && exists(/databases/$(database)/documents/asis_groups/$(request.resource.data.groupId))
+        && asisStr(request.resource.data.groupName, 1, 60)
+        && asisYmd(request.resource.data.date)
+        && request.resource.data.label is string && request.resource.data.label.size() <= 60
+        && request.resource.data.status == 'open'
+        && request.resource.data.startedAt == request.time
+        && request.resource.data.startedBy == request.auth.uid
+        && asisStr(request.resource.data.startedByName, 1, 80)
+        && request.resource.data.totals == null;
+
+      // Cualquier docente cierra una sesión ABIERTA (una sola vez).
+      // Una sesión cerrada solo la modifica un admin, sin tocar sus datos de origen.
+      allow update: if
+        (asisIsStaff()
+          && resource.data.status == 'open'
+          && request.resource.data.status == 'closed'
+          && asisChanged().hasOnly(['status', 'closedAt', 'closedBy', 'closedByName', 'totals'])
+          && request.resource.data.closedAt == request.time
+          && request.resource.data.closedBy == request.auth.uid
+          && asisStr(request.resource.data.closedByName, 1, 80)
+          && request.resource.data.totals is map)
+        || (asisIsAdmin()
+          && request.resource.data.status in ['open', 'closed']
+          && !asisChanged().hasAny(['groupId', 'date', 'startedAt', 'startedBy']));
+
+      allow delete: if false;
+    }
+
+    // ── Registros de asistencia ──────────────────────────────────────────
+    // id determinista `${sessionId}_${studentId}`: imposible duplicar a un alumno
+    // en la misma sesión. Nunca se borran; cada cambio exige su entrada de auditoría.
+    match /asis_records/{recordId} {
+      allow read: if asisIsStaff();
+
+      allow create: if asisIsStaff()
+        && request.resource.data.keys().hasOnly(['sessionId', 'studentId', 'studentName', 'enrollmentId',
+                                                 'groupId', 'groupName', 'date', 'status', 'method',
+                                                 'recordedAt', 'recordedBy', 'recordedByName', 'correctionCount'])
+        && asisStr(request.resource.data.sessionId, 1, 128)
+        && asisStr(request.resource.data.studentId, 1, 128)
+        && recordId == request.resource.data.sessionId + '_' + request.resource.data.studentId
+        && (asisSession(request.resource.data.sessionId).status == 'open' || asisIsAdmin())
+        && asisSession(request.resource.data.sessionId).groupId == request.resource.data.groupId
+        && asisSession(request.resource.data.sessionId).date == request.resource.data.date
+        && asisStr(request.resource.data.studentName, 1, 120)
+        && asisOptStr(request.resource.data.enrollmentId, 40)
+        && asisStr(request.resource.data.groupName, 1, 60)
+        && asisStatus(request.resource.data.status)
+        && request.resource.data.method in ['qr', 'manual', 'auto']
+        && (request.resource.data.method != 'qr' || request.resource.data.status == 'present')
+        && (request.resource.data.method != 'auto' || request.resource.data.status == 'absent')
+        && request.resource.data.recordedAt == request.time
+        && request.resource.data.recordedBy == request.auth.uid
+        && asisStr(request.resource.data.recordedByName, 1, 80)
+        && request.resource.data.correctionCount == 0;
+
+      allow update: if asisIsStaff()
+        && (asisSession(resource.data.sessionId).status == 'open' || asisIsAdmin())
+        && asisChanged().hasOnly(['status', 'note', 'correctionCount', 'updatedAt', 'updatedBy', 'updatedByName'])
+        && asisStatus(request.resource.data.status)
+        && request.resource.data.note is string && request.resource.data.note.size() <= 300
+        && request.resource.data.correctionCount == resource.data.correctionCount + 1
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.updatedBy == request.auth.uid
+        && asisStr(request.resource.data.updatedByName, 1, 80)
+        && existsAfter(/databases/$(database)/documents/asis_audit/$(recordId + '_' + string(request.resource.data.correctionCount)));
+
+      allow delete: if false;
+    }
+
+    // ── Auditoría de correcciones (solo se agrega, nunca se edita) ───────
+    match /asis_audit/{auditId} {
+      allow read: if asisIsStaff();
+      allow create: if asisIsStaff()
+        && request.resource.data.keys().hasOnly(['type', 'recordId', 'sessionId', 'studentId', 'studentName',
+                                                 'from', 'to', 'note', 'by', 'byName', 'at'])
+        && request.resource.data.type == 'record_correction'
+        && asisStr(request.resource.data.recordId, 1, 300)
+        && auditId == request.resource.data.recordId + '_'
+             + string(getAfter(/databases/$(database)/documents/asis_records/$(request.resource.data.recordId)).data.correctionCount)
+        && getAfter(/databases/$(database)/documents/asis_records/$(request.resource.data.recordId)).data.status == request.resource.data.to
+        && asisStatus(request.resource.data.from)
+        && asisStatus(request.resource.data.to)
+        && request.resource.data.by == request.auth.uid
+        && request.resource.data.at == request.time;
+      allow update, delete: if false;
+    }
+    // <<< ASISTENCIA ESCOLAR <<<
+  }
+}

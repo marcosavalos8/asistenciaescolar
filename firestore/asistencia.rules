@@ -1,0 +1,256 @@
+    // ══════════════════════════════════════════════════════════════════════
+    // ── ASISTENCIA ESCOLAR (colecciones con prefijo asis_) ────────────────
+    // Bloque autocontenido: va DENTRO de `match /databases/{database}/documents`.
+    // Acceso solo para usuarios con documento activo en asis_users (los
+    // usuarios de citasFacil no ven nada aunque compartan Authentication).
+    // ══════════════════════════════════════════════════════════════════════
+
+    function asisSignedIn() {
+      return request.auth != null;
+    }
+    function asisUserPath(uid) {
+      return /databases/$(database)/documents/asis_users/$(uid);
+    }
+    function asisIsStaff() {
+      return asisSignedIn()
+        && exists(asisUserPath(request.auth.uid))
+        && get(asisUserPath(request.auth.uid)).data.active == true;
+    }
+    function asisIsAdmin() {
+      return asisIsStaff() && get(asisUserPath(request.auth.uid)).data.role == 'admin';
+    }
+    function asisStr(v, min, max) {
+      return v is string && v.size() >= min && v.size() <= max;
+    }
+    function asisOptStr(v, max) {
+      return v == null || asisStr(v, 1, max);
+    }
+    function asisYmd(v) {
+      return v is string && v.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
+    }
+    function asisStatus(v) {
+      return v in ['present', 'late', 'absent', 'justified'];
+    }
+    function asisChanged() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+    function asisVerifiedEmail() {
+      return asisSignedIn()
+        && request.auth.token.email is string
+        && request.auth.token.email_verified == true;
+    }
+    function asisSession(id) {
+      return get(/databases/$(database)/documents/asis_sessions/$(id)).data;
+    }
+
+    // ── Usuarios autorizados ─────────────────────────────────────────────
+    function asisValidUser(d) {
+      return d.keys().hasOnly(['email', 'displayName', 'role', 'active', 'createdAt', 'createdBy', 'lastSeen'])
+        && asisStr(d.email, 3, 254)
+        && asisStr(d.displayName, 1, 80)
+        && d.role in ['admin', 'teacher']
+        && d.active is bool;
+    }
+    function asisInvitePath() {
+      return /databases/$(database)/documents/asis_invites/$(request.auth.token.email.lower());
+    }
+
+    match /asis_users/{uid} {
+      allow get: if asisSignedIn() && (request.auth.uid == uid || asisIsAdmin());
+      allow list: if asisIsAdmin();
+
+      // a) Un admin da de alta a alguien (por UID).
+      // b) Un invitado con correo VERIFICADO reclama su invitación: el rol
+      //    debe ser exactamente el de la invitación (no puede autoasignarse admin).
+      allow create: if asisValidUser(request.resource.data)
+        && request.resource.data.createdAt == request.time
+        && (
+          asisIsAdmin()
+          || (request.auth.uid == uid
+              && asisVerifiedEmail()
+              && exists(asisInvitePath())
+              && request.resource.data.email == request.auth.token.email.lower()
+              && request.resource.data.role == get(asisInvitePath()).data.role
+              && request.resource.data.active == true)
+        );
+
+      // El admin gestiona a OTROS usuarios (no puede degradarse ni bloquearse a sí mismo).
+      // Cada usuario solo puede tocar su nombre visible y lastSeen: nunca su rol ni su estado.
+      allow update: if asisValidUser(request.resource.data)
+        && (
+          (asisIsAdmin() && uid != request.auth.uid
+            && request.resource.data.email == resource.data.email)
+          || (asisSignedIn() && uid == request.auth.uid
+              && asisChanged().hasOnly(['displayName', 'lastSeen'])
+              && (!('lastSeen' in asisChanged()) || request.resource.data.lastSeen == request.time))
+        );
+
+      allow delete: if asisIsAdmin() && uid != request.auth.uid;
+    }
+
+    // ── Invitaciones (id = correo en minúsculas) ─────────────────────────
+    match /asis_invites/{email} {
+      allow get: if asisIsAdmin()
+        || (asisSignedIn() && request.auth.token.email is string && email == request.auth.token.email.lower());
+      allow list: if asisIsAdmin();
+      allow create, update: if asisIsAdmin()
+        && request.resource.data.keys().hasOnly(['email', 'displayName', 'role', 'createdAt', 'createdBy'])
+        && request.resource.data.email == email
+        && asisStr(email, 3, 254)
+        && asisStr(request.resource.data.displayName, 1, 80)
+        && request.resource.data.role in ['admin', 'teacher']
+        && request.resource.data.createdBy == request.auth.uid;
+      allow delete: if asisIsAdmin()
+        || (asisVerifiedEmail() && email == request.auth.token.email.lower());
+    }
+
+    // ── Configuración institucional ──────────────────────────────────────
+    match /asis_settings/{docId} {
+      allow read: if asisIsStaff();
+      allow write: if asisIsAdmin()
+        && docId == 'institution'
+        && request.resource.data.keys().hasOnly(['name', 'timezone', 'updatedAt', 'updatedBy'])
+        && asisStr(request.resource.data.name, 1, 100)
+        && asisStr(request.resource.data.timezone, 1, 64)
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.updatedBy == request.auth.uid;
+    }
+
+    // ── Grupos ───────────────────────────────────────────────────────────
+    function asisValidGroup(d) {
+      return d.keys().hasOnly(['name', 'description', 'active', 'createdAt', 'createdBy'])
+        && asisStr(d.name, 1, 60)
+        && d.description is string && d.description.size() <= 200
+        && d.active is bool;
+    }
+    match /asis_groups/{groupId} {
+      allow read: if asisIsStaff();
+      allow create: if asisIsAdmin()
+        && asisValidGroup(request.resource.data)
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.createdBy == request.auth.uid;
+      allow update: if asisIsAdmin()
+        && asisValidGroup(request.resource.data)
+        && asisChanged().hasOnly(['name', 'description', 'active']);
+      allow delete: if asisIsAdmin();
+    }
+
+    // ── Alumnos ──────────────────────────────────────────────────────────
+    function asisValidStudent(d) {
+      return d.keys().hasOnly(['fullName', 'nameLower', 'enrollmentId', 'groupId', 'active', 'qrToken',
+                               'createdAt', 'updatedAt', 'createdBy'])
+        && asisStr(d.fullName, 1, 120)
+        && asisStr(d.nameLower, 1, 120)
+        && asisOptStr(d.enrollmentId, 40)
+        && asisStr(d.groupId, 1, 128)
+        && d.active is bool
+        && asisStr(d.qrToken, 22, 64)
+        && d.updatedAt == request.time;
+    }
+    match /asis_students/{studentId} {
+      allow read: if asisIsStaff();
+      allow create: if asisIsAdmin()
+        && asisValidStudent(request.resource.data)
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.createdBy == request.auth.uid;
+      allow update: if asisIsAdmin()
+        && asisValidStudent(request.resource.data)
+        && asisChanged().hasOnly(['fullName', 'nameLower', 'enrollmentId', 'groupId', 'active', 'qrToken', 'updatedAt']);
+      // Borrar la ficha NO borra sus registros de asistencia (asis_records es inmutable).
+      allow delete: if asisIsAdmin();
+    }
+
+    // ── Sesiones de asistencia ───────────────────────────────────────────
+    match /asis_sessions/{sessionId} {
+      allow read: if asisIsStaff();
+
+      allow create: if asisIsStaff()
+        && request.resource.data.keys().hasOnly(['groupId', 'groupName', 'date', 'label', 'status',
+                                                 'startedAt', 'startedBy', 'startedByName', 'totals'])
+        && exists(/databases/$(database)/documents/asis_groups/$(request.resource.data.groupId))
+        && asisStr(request.resource.data.groupName, 1, 60)
+        && asisYmd(request.resource.data.date)
+        && request.resource.data.label is string && request.resource.data.label.size() <= 60
+        && request.resource.data.status == 'open'
+        && request.resource.data.startedAt == request.time
+        && request.resource.data.startedBy == request.auth.uid
+        && asisStr(request.resource.data.startedByName, 1, 80)
+        && request.resource.data.totals == null;
+
+      // Cualquier docente cierra una sesión ABIERTA (una sola vez).
+      // Una sesión cerrada solo la modifica un admin, sin tocar sus datos de origen.
+      allow update: if
+        (asisIsStaff()
+          && resource.data.status == 'open'
+          && request.resource.data.status == 'closed'
+          && asisChanged().hasOnly(['status', 'closedAt', 'closedBy', 'closedByName', 'totals'])
+          && request.resource.data.closedAt == request.time
+          && request.resource.data.closedBy == request.auth.uid
+          && asisStr(request.resource.data.closedByName, 1, 80)
+          && request.resource.data.totals is map)
+        || (asisIsAdmin()
+          && request.resource.data.status in ['open', 'closed']
+          && !asisChanged().hasAny(['groupId', 'date', 'startedAt', 'startedBy']));
+
+      allow delete: if false;
+    }
+
+    // ── Registros de asistencia ──────────────────────────────────────────
+    // id determinista `${sessionId}_${studentId}`: imposible duplicar a un alumno
+    // en la misma sesión. Nunca se borran; cada cambio exige su entrada de auditoría.
+    match /asis_records/{recordId} {
+      allow read: if asisIsStaff();
+
+      allow create: if asisIsStaff()
+        && request.resource.data.keys().hasOnly(['sessionId', 'studentId', 'studentName', 'enrollmentId',
+                                                 'groupId', 'groupName', 'date', 'status', 'method',
+                                                 'recordedAt', 'recordedBy', 'recordedByName', 'correctionCount'])
+        && asisStr(request.resource.data.sessionId, 1, 128)
+        && asisStr(request.resource.data.studentId, 1, 128)
+        && recordId == request.resource.data.sessionId + '_' + request.resource.data.studentId
+        && (asisSession(request.resource.data.sessionId).status == 'open' || asisIsAdmin())
+        && asisSession(request.resource.data.sessionId).groupId == request.resource.data.groupId
+        && asisSession(request.resource.data.sessionId).date == request.resource.data.date
+        && asisStr(request.resource.data.studentName, 1, 120)
+        && asisOptStr(request.resource.data.enrollmentId, 40)
+        && asisStr(request.resource.data.groupName, 1, 60)
+        && asisStatus(request.resource.data.status)
+        && request.resource.data.method in ['qr', 'manual', 'auto']
+        && (request.resource.data.method != 'qr' || request.resource.data.status == 'present')
+        && (request.resource.data.method != 'auto' || request.resource.data.status == 'absent')
+        && request.resource.data.recordedAt == request.time
+        && request.resource.data.recordedBy == request.auth.uid
+        && asisStr(request.resource.data.recordedByName, 1, 80)
+        && request.resource.data.correctionCount == 0;
+
+      allow update: if asisIsStaff()
+        && (asisSession(resource.data.sessionId).status == 'open' || asisIsAdmin())
+        && asisChanged().hasOnly(['status', 'note', 'correctionCount', 'updatedAt', 'updatedBy', 'updatedByName'])
+        && asisStatus(request.resource.data.status)
+        && request.resource.data.note is string && request.resource.data.note.size() <= 300
+        && request.resource.data.correctionCount == resource.data.correctionCount + 1
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.updatedBy == request.auth.uid
+        && asisStr(request.resource.data.updatedByName, 1, 80)
+        && existsAfter(/databases/$(database)/documents/asis_audit/$(recordId + '_' + string(request.resource.data.correctionCount)));
+
+      allow delete: if false;
+    }
+
+    // ── Auditoría de correcciones (solo se agrega, nunca se edita) ───────
+    match /asis_audit/{auditId} {
+      allow read: if asisIsStaff();
+      allow create: if asisIsStaff()
+        && request.resource.data.keys().hasOnly(['type', 'recordId', 'sessionId', 'studentId', 'studentName',
+                                                 'from', 'to', 'note', 'by', 'byName', 'at'])
+        && request.resource.data.type == 'record_correction'
+        && asisStr(request.resource.data.recordId, 1, 300)
+        && auditId == request.resource.data.recordId + '_'
+             + string(getAfter(/databases/$(database)/documents/asis_records/$(request.resource.data.recordId)).data.correctionCount)
+        && getAfter(/databases/$(database)/documents/asis_records/$(request.resource.data.recordId)).data.status == request.resource.data.to
+        && asisStatus(request.resource.data.from)
+        && asisStatus(request.resource.data.to)
+        && request.resource.data.by == request.auth.uid
+        && request.resource.data.at == request.time;
+      allow update, delete: if false;
+    }
